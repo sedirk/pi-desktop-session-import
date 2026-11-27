@@ -10,6 +10,9 @@ semver; the plugin id is `io.github.muzimu217.session-import`.
   - 自动识别多段分页会话（`rollout-<ts>-<threadId>[_<pageId>]`）并按时间顺序完整合并；
   - 优先读取 `state_5.sqlite` 与 `session_index.jsonl` 中的真实标题与项目映射，解决未选目录时的临时目录伪工作区问题；
   - 过滤 `subagent` 子智能体派生会话，支持 `custom_tool_call` 工具记录并保留交互问答回复。
+- **fix(timeout): 超长会话导入超时提升至 180s 并绕过宿主面板 30s IPC 硬上限**：
+  - 将单会话转换（`CONVERT_TIMEOUT_MS`）、前台扫描（`SCAN_TIMEOUT_MS`）与宿主批量导入（`IMPORT_TIMEOUT_MS`）超时预算统一调整为 `180s`；
+  - 新增 `panel.asyncStart` / `panel.asyncPoll` 异步短轮询通道，避免导入、预览或蒸馏超长对话时撞上 PI-Desktop 宿主面板 `pluginBridge.invoke` 的 `30s`（`PLUGIN_PANEL_TIMEOUT_MS`）硬超时失败。
 
 ## 0.4.8 — 2026-09-11（导入行为修正）
 

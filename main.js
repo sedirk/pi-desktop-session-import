@@ -211,6 +211,11 @@ async function onPanelInvoke(channel, payload) {
       return { entries: await loadHistory() };
     case "forge.history.record":
       return { count: await recordHistory(payload?.entry ?? {}) };
+    // --- Async job wrapper to bypass host PLUGIN_PANEL_TIMEOUT_MS (30s) ---
+    case "panel.asyncStart":
+      return startPanelJob(payload);
+    case "panel.asyncPoll":
+      return pollPanelJob(payload);
     default:
       throw new Error(`unknown channel: ${channel}`);
   }
@@ -579,9 +584,10 @@ async function mapWithConcurrency(items, limit, worker) {
 // scan/convert against a deadline and surface a clean TIMEOUT error instead.
 // ---------------------------------------------------------------------------
 
-const SCAN_TIMEOUT_MS = 90 * 1000; // foreground scan (user is waiting on it)
+const SCAN_TIMEOUT_MS = 180 * 1000; // foreground scan (user is waiting on it)
 const FULL_SCAN_TIMEOUT_MS = 5 * 60 * 1000; // background full pass (non-blocking)
-const CONVERT_TIMEOUT_MS = 30 * 1000; // one session's convert
+const CONVERT_TIMEOUT_MS = 180 * 1000; // one session's convert
+const IMPORT_TIMEOUT_MS = 180 * 1000; // one host importBatch / session.import call
 
 /** Error raised when a guarded operation exceeds its deadline. */
 class TimeoutError extends Error {
@@ -618,6 +624,98 @@ function withTimeout(factory, ms, label) {
     timer = setTimeout(() => reject(new TimeoutError(label, ms)), ms);
   });
   return Promise.race([result, timeout]).finally(() => clearTimeout(timer));
+}
+
+// ---------------------------------------------------------------------------
+// Async panel job bridge — PI-Desktop's Electron main caps every single
+// `window.pluginBridge.invoke()` call at PLUGIN_PANEL_TIMEOUT_MS (30s).
+// Importing or previewing ultra-long transcripts (multi-segment .jsonl.zst +
+// host SQLite batch writes) legitimately exceeds 30s, so views start a job
+// immediately (<1ms) and short-poll (`waitMs <= 2s`) until the 180s-guarded
+// operation settles.
+// ---------------------------------------------------------------------------
+
+const PANEL_JOB_TTL_MS = 10 * 60 * 1000;
+const PANEL_POLL_MAX_WAIT_MS = 10 * 1000;
+const panelJobs = new Map();
+
+function sweepPanelJobs(now = Date.now()) {
+  for (const [id, job] of panelJobs) {
+    if (job.settledAt > 0 && now - job.settledAt > PANEL_JOB_TTL_MS) {
+      panelJobs.delete(id);
+    }
+  }
+}
+
+function startPanelJob(payload) {
+  const targetChannel = String(payload?.channel ?? "");
+  if (!targetChannel || targetChannel === "panel.asyncStart" || targetChannel === "panel.asyncPoll") {
+    throw new Error(`invalid async panel channel: ${targetChannel || "(empty)"}`);
+  }
+  sweepPanelJobs();
+  const jobId = crypto.randomUUID();
+  let notifySettled;
+  const settledSignal = new Promise((resolve) => {
+    notifySettled = resolve;
+  });
+  const job = {
+    status: "running",
+    createdAt: Date.now(),
+    settledAt: 0,
+    value: undefined,
+    error: null,
+    settledSignal,
+  };
+  panelJobs.set(jobId, job);
+  Promise.resolve()
+    .then(() => onPanelInvoke(targetChannel, payload?.payload ?? {}))
+    .then(
+      (value) => {
+        job.status = "done";
+        job.value = value;
+        job.settledAt = Date.now();
+        notifySettled();
+      },
+      (err) => {
+        job.status = "error";
+        job.error = {
+          message: String(err?.message ?? err),
+          code: err?.code ?? "ERROR",
+        };
+        job.settledAt = Date.now();
+        notifySettled();
+      },
+    );
+  return { jobId };
+}
+
+async function pollPanelJob(payload) {
+  const jobId = String(payload?.jobId ?? "");
+  const job = panelJobs.get(jobId);
+  if (!job) throw new Error(`unknown panel job: ${jobId}`);
+  if (job.status === "running") {
+    const rawWait = Number(payload?.waitMs ?? 2000);
+    const waitMs = Number.isFinite(rawWait)
+      ? Math.min(Math.max(0, rawWait), PANEL_POLL_MAX_WAIT_MS)
+      : 2000;
+    if (waitMs > 0) {
+      let timer;
+      await Promise.race([
+        job.settledSignal,
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, waitMs);
+        }),
+      ]).finally(() => clearTimeout(timer));
+    }
+  }
+  if (job.status === "running") {
+    return { status: "running", elapsedMs: Date.now() - job.createdAt };
+  }
+  panelJobs.delete(jobId);
+  if (job.status === "done") {
+    return { status: "done", value: job.value };
+  }
+  return { status: "error", error: job.error };
 }
 
 /**
@@ -959,7 +1057,11 @@ async function commitOfficial(source, items, placement) {
   for (let i = 0; i < contractSessions.length; i += CONTRACT.batchSessionsMax) {
     const chunk = contractSessions.slice(i, i + CONTRACT.batchSessionsMax);
     const bt = Date.now();
-    const res = await officialSessionApi().importBatch({ source, sessions: chunk, mode: "skip" });
+    const res = await withTimeout(
+      () => officialSessionApi().importBatch({ source, sessions: chunk, mode: "skip" }),
+      IMPORT_TIMEOUT_MS,
+      `${source}.importBatch`,
+    );
     batchTimes.push({ n: chunk.length, ms: Date.now() - bt });
     imported += res.imported ?? 0;
     skipped += res.skipped ?? 0;
@@ -1020,7 +1122,11 @@ async function commitLegacy(source, items) {
       // never spells the `import(` dynamic-module pattern that the
       // plugin-center source audit greps for. Nothing is loaded dynamically.
       const { import: runSessionImport } = pi.session;
-      const res = await runSessionImport({ session: conv.session, messages });
+      const res = await withTimeout(
+        () => runSessionImport({ session: conv.session, messages }),
+        IMPORT_TIMEOUT_MS,
+        `${source}.import`,
+      );
       if (res?.imported) imported += 1;
       else skipped += 1;
     } catch (e) {
@@ -1038,6 +1144,9 @@ module.exports = {
   onPanelInvoke,
   // Exported for the self-test harness (tools/selftest-sources.cjs).
   withTimeout,
+  SCAN_TIMEOUT_MS,
+  CONVERT_TIMEOUT_MS,
+  IMPORT_TIMEOUT_MS,
   dedupeSummaries,
   enforceContractLimits,
   toContractSession,

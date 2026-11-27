@@ -712,6 +712,93 @@ describe("P1-F3+F4 forge.save (modes) + forge.history", () => {
   });
 });
 
+describe("180s timeout budgets + panel.asyncStart / panel.asyncPoll", () => {
+  beforeEach(() => {
+    delete require.cache[require.resolve(`${PLUGIN_DIR}/main.js`)];
+    installRegistry([]);
+  });
+
+  test("timeout constants are set to 180s for scan, convert, and host import", () => {
+    const main = freshMain();
+    assert.strictEqual(main.SCAN_TIMEOUT_MS, 180 * 1000);
+    assert.strictEqual(main.CONVERT_TIMEOUT_MS, 180 * 1000);
+    assert.strictEqual(main.IMPORT_TIMEOUT_MS, 180 * 1000);
+  });
+
+  test("panel.asyncStart + panel.asyncPoll runs long panel operations across short polls", async () => {
+    let releaseConvert;
+    const gate = new Promise((resolve) => {
+      releaseConvert = resolve;
+    });
+    installRegistry([
+      {
+        source: "slow",
+        label: "Slow",
+        scan: async () => [],
+        convert: async (item) => {
+          await gate;
+          return {
+            session: {
+              id: `imp-${item.externalId}`,
+              title: "Long Conversation",
+              mode: "agent",
+              createdAt: "2026-10-01T00:00:00.000Z",
+              updatedAt: "2026-10-01T01:00:00.000Z",
+            },
+            messages: [{ role: "user", content: "hello", createdAt: "2026-10-01T00:00:00.000Z" }],
+          };
+        },
+      },
+    ]);
+    globalThis.pi = {
+      commands: { register: async () => {}, unregister: async () => {} },
+      ui: { openPanel: async () => {} },
+      session: {
+        importBatch: async (input) => ({
+          imported: input.sessions.length,
+          skipped: 0,
+          results: input.sessions.map((s) => ({ externalId: s.externalId, status: "imported" })),
+        }),
+      },
+    };
+    const main = freshMain();
+    const started = await main.onPanelInvoke("panel.asyncStart", {
+      channel: "import.commit",
+      payload: { source: "slow", items: [{ externalId: "u1" }] },
+    });
+    assert.ok(started.jobId, "jobId returned immediately");
+
+    const p1 = await main.onPanelInvoke("panel.asyncPoll", { jobId: started.jobId, waitMs: 10 });
+    assert.strictEqual(p1.status, "running", "still running while gate is closed");
+
+    releaseConvert();
+    const p2 = await main.onPanelInvoke("panel.asyncPoll", { jobId: started.jobId, waitMs: 500 });
+    assert.strictEqual(p2.status, "done");
+    assert.strictEqual(p2.value.imported, 1);
+
+    // Consumed job is cleaned up
+    await assert.rejects(
+      () => main.onPanelInvoke("panel.asyncPoll", { jobId: started.jobId, waitMs: 0 }),
+      /unknown panel job/,
+    );
+  });
+
+  test("panel.asyncStart surfaces inner errors and rejects recursive channels", async () => {
+    const main = freshMain();
+    await assert.rejects(
+      () => main.onPanelInvoke("panel.asyncStart", { channel: "panel.asyncStart" }),
+      /invalid async panel channel/,
+    );
+    const started = await main.onPanelInvoke("panel.asyncStart", {
+      channel: "import.convertBatch",
+      payload: { source: "missing", items: [] },
+    });
+    const poll = await main.onPanelInvoke("panel.asyncPoll", { jobId: started.jobId, waitMs: 200 });
+    assert.strictEqual(poll.status, "error");
+    assert.match(poll.error.message, /unknown source: missing/);
+  });
+});
+
 after(() => {
   // Reset global pi to avoid leaking into sibling test files.
   delete globalThis.pi;

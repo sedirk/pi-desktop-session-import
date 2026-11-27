@@ -394,6 +394,39 @@
     <script>
       "use strict";
       const bridge = window.pluginBridge;
+      const PANEL_CALL_TIMEOUT_MS = 180 * 1000;
+      // PI-Desktop caps each raw pluginBridge.invoke() at 30s; run potentially
+      // heavy scan / preview / import operations via short-polled async jobs.
+      async function invokeLong(channel, payload, timeoutMs = PANEL_CALL_TIMEOUT_MS) {
+        let started;
+        try {
+          started = await bridge.invoke("panel.asyncStart", { channel, payload });
+        } catch (err) {
+          if (/unknown channel/i.test(String(err?.message ?? err))) {
+            return bridge.invoke(channel, payload);
+          }
+          throw err;
+        }
+        const deadline = Date.now() + timeoutMs;
+        while (true) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) {
+            const err = new Error(`${channel} 在 ${Math.round(timeoutMs / 1000)}s 内未完成（已超时）`);
+            err.code = "TIMEOUT";
+            throw err;
+          }
+          const poll = await bridge.invoke("panel.asyncPoll", {
+            jobId: started.jobId,
+            waitMs: Math.min(2000, remaining),
+          });
+          if (poll.status === "done") return poll.value;
+          if (poll.status === "error") {
+            const err = new Error(poll.error?.message || "panel job failed");
+            if (poll.error?.code) err.code = poll.error.code;
+            throw err;
+          }
+        }
+      }
       const SI = window.SI18n;
       let locale = SI.detectLocale();
       const t = (key, params) => SI.getMessage(locale, key, params);
@@ -520,7 +553,7 @@
           cards.map(async ({ adapter, card }) => {
             let res;
             try {
-              res = await bridge.invoke("import.scanSource", { source: adapter.source });
+              res = await invokeLong("import.scanSource", { source: adapter.source });
             } catch {
               res = { found: false, count: 0 };
             }
@@ -762,11 +795,14 @@
           const cacheKey = `${state.activeSource}:${summary.externalId}`;
           let converted = state.cache.get(cacheKey);
           if (!converted) {
-            const res = await bridge.invoke("import.convertBatch", {
+            const res = await invokeLong("import.convertBatch", {
               source: state.activeSource,
               items: [summary],
             });
             converted = res.sessions[0];
+            if (!converted) {
+              throw new Error("会话转换超时或内容不可读");
+            }
             state.cache.set(cacheKey, converted);
           }
           $("pv-title").textContent = converted.session.title;
@@ -819,11 +855,19 @@
           // Single entry point: main.js decides official importBatch vs the
           // legacy session.import bridge, and falls back gracefully when the
           // host exposes no session-import API at all.
-          const r = await bridge.invoke("import.commit", {
-            source: state.activeSource,
-            items: summaries,
-            placement: "project",
-          });
+          const commitBudgetMs = Math.max(
+            PANEL_CALL_TIMEOUT_MS * 2,
+            summaries.length * PANEL_CALL_TIMEOUT_MS,
+          );
+          const r = await invokeLong(
+            "import.commit",
+            {
+              source: state.activeSource,
+              items: summaries,
+              placement: "project",
+            },
+            commitBudgetMs,
+          );
           window.__lastTimings = r.timings || null;
           const parts = [t("importer.imported", { count: r.imported })];
           if (r.skipped) parts.push(t("importer.skipped", { count: r.skipped }));

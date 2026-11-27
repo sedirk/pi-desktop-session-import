@@ -223,7 +223,40 @@
         .then(applyAppearance)
         .catch(() => applyAppearance(null));
 
-      const call = (channel, payload) => window.pluginBridge.invoke(channel, payload);
+      const PANEL_CALL_TIMEOUT_MS = 180 * 1000;
+      async function call(channel, payload) {
+        if (channel !== "forge.distill") {
+          return window.pluginBridge.invoke(channel, payload);
+        }
+        let started;
+        try {
+          started = await window.pluginBridge.invoke("panel.asyncStart", { channel, payload });
+        } catch (err) {
+          if (/unknown channel/i.test(String(err?.message ?? err))) {
+            return window.pluginBridge.invoke(channel, payload);
+          }
+          throw err;
+        }
+        const deadline = Date.now() + PANEL_CALL_TIMEOUT_MS;
+        while (true) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) {
+            const err = new Error(`${channel} 在 ${Math.round(PANEL_CALL_TIMEOUT_MS / 1000)}s 内未完成（已超时）`);
+            err.code = "TIMEOUT";
+            throw err;
+          }
+          const poll = await window.pluginBridge.invoke("panel.asyncPoll", {
+            jobId: started.jobId,
+            waitMs: Math.min(2000, remaining),
+          });
+          if (poll.status === "done") return poll.value;
+          if (poll.status === "error") {
+            const err = new Error(poll.error?.message || "panel job failed");
+            if (poll.error?.code) err.code = poll.error.code;
+            throw err;
+          }
+        }
+      }
 
       async function loadModels() {
         try {
